@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone
+from twilio.rest import Client
+from fastapi.responses import JSONResponse
+from fastapi import Request
+from fastapi.responses import PlainTextResponse
 import os
 import logging
 import base64
@@ -31,6 +35,14 @@ except Exception:
 # ---------------------------
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
+
+# ---------------------------
+# Twilio Setup
+# ---------------------------
+account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
+twilio_client = Client(account_sid, auth_token)
 
 # ---------------------------
 # Logging
@@ -509,6 +521,67 @@ async def change_language(session_id: str, language: str):
     await broadcast_message(session_id, reply)
     
     return {"message": reply, "language": language.lower()}
+
+@api_router.post("/send-whatsapp")
+async def send_whatsapp(request: Request):
+    try:
+        data = await request.json()
+        to_number = data.get("to")        # e.g., "+919876543210"
+        message_body = data.get("message")
+
+        message = twilio_client.messages.create(
+            from_=f"whatsapp:{whatsapp_number}",
+            body=message_body,
+            to=f"whatsapp:{to_number}"
+        )
+
+        return JSONResponse({"status": "success", "sid": message.sid})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@api_router.post("/whatsapp/incoming")
+async def whatsapp_incoming(request: Request):
+    """
+    Handles incoming WhatsApp messages from Twilio and returns an AI-generated reply.
+    """
+    try:
+        data = await request.form()
+        from_number = data.get("From")  # e.g. 'whatsapp:+918712355975'
+        body = data.get("Body", "").strip()
+
+        print(f"📩 WhatsApp message from {from_number}: {body}")
+
+        # Create or find chat session for this WhatsApp user
+        session_id = from_number.replace("whatsapp:", "")
+        session = await db.chat_sessions.find_one({"id": session_id})
+
+        if not session:
+            # Create a new session if not found
+            new_session = ChatSession(
+                id=session_id,
+                user_id=session_id,
+                language="english"
+            )
+            await db.chat_sessions.insert_one(prepare_for_mongo(new_session.dict()))
+            print(f"🆕 New session created for {from_number}")
+
+        # Generate AI reply using your existing logic
+        ai_reply = await get_ai_response(session_id, body, None, "english")
+
+        # Send reply back to WhatsApp via Twilio
+        twilio_client.messages.create(
+            from_=f"whatsapp:{whatsapp_number}",
+            body=ai_reply,
+            to=from_number
+        )
+
+        print(f"✅ Sent AI reply to {from_number}")
+        return PlainTextResponse("OK", status_code=200)
+
+    except Exception as e:
+        print(f"❌ Error in WhatsApp webhook: {e}")
+        return PlainTextResponse("Error", status_code=500)
+
 
 # ---------------------------
 # WebSocket
